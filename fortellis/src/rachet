@@ -1,0 +1,538 @@
+CREATE OR REPLACE PROCEDURE PAS.ratchet
+(
+  p_referral_id IN NUMBER,
+  p_userid      IN VARCHAR2,
+  p_commit      IN VARCHAR2 DEFAULT 'N'   -- 'Y' to commit; otherwise dry-run (rollback)
+)
+AS
+  ---------------------------------------------------------------------------
+  -- Counters
+  ---------------------------------------------------------------------------
+  -- Stage 0
+  v_upd_ref        PLS_INTEGER := 0;
+
+  -- Stage 1
+  v_ins_ovr        PLS_INTEGER := 0;
+  v_upd_ovr        PLS_INTEGER := 0;
+  v_ins_intake     PLS_INTEGER := 0;
+  v_ins_diag       PLS_INTEGER := 0;
+  v_ins_xref       PLS_INTEGER := 0;
+  v_upd_ovr_eval   PLS_INTEGER := 0;
+  v_upd_ovr_evldtl PLS_INTEGER := 0;
+
+  -- Stage 2
+  v_ins_amend        PLS_INTEGER := 0;
+  v_ins_amend_srvc   PLS_INTEGER := 0;
+  v_ins_prof         PLS_INTEGER := 0;
+  v_ins_prof_dt      PLS_INTEGER := 0;
+  v_ins_prof_hrs     PLS_INTEGER := 0;
+  v_ins_prov         PLS_INTEGER := 0;
+  v_ins_prof_srv     PLS_INTEGER := 0;
+  v_ins_prof_srvdtl  PLS_INTEGER := 0;
+  v_ins_prof_mtrx    PLS_INTEGER := 0;
+  v_ins_dsch         PLS_INTEGER := 0;
+
+  -- Stage 3
+  v_ins_caps       PLS_INTEGER := 0;
+
+  ---------------------------------------------------------------------------
+  -- Autonomous logger
+  ---------------------------------------------------------------------------
+  PROCEDURE log_event(p_process IN VARCHAR2, p_msg IN VARCHAR2) IS
+    PRAGMA AUTONOMOUS_TRANSACTION;
+    v_id NUMBER;
+  BEGIN
+    SELECT NVL(MAX(err_log_id), 0) + 1
+      INTO v_id
+      FROM PAS.PAS_ERROR_LOG;
+
+    INSERT INTO PAS.PAS_ERROR_LOG
+      (err_log_id, err_process, err_msg, created_by, created_time)
+    VALUES
+      (v_id, p_process, SUBSTR(p_msg,1,4000), p_userid, SYSDATE);
+
+    COMMIT;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END log_event;
+
+BEGIN
+  log_event('RATCHET', 'BEGIN un-hammer (stage-0/1/2/3) for referral '||p_referral_id);
+---------------------------------------------------------------------------
+-- ===========================
+-- Stage 0 (TEMP HOTFIX): Hard-code header for a single referral
+--   ? Applies ONLY to referral_id = 115361
+--   ? Sets:
+--         STATUS_CD        = 'APR'
+--         SERVICE_TYPE     = 2         -- numeric code for SDPAS / Self-Direct
+--         SERVICE_SUB_TYPE = 'SD'
+--
+-- ?? IMPORTANT (permanent fix needed):
+--   These values MUST become procedure parameters:
+--      p_target_referral_id
+--      p_status_cd
+--      p_service_type
+--      p_service_sub_type
+--   Then remove this hard-coded block entirely.
+-- ===========================
+---------------------------------------------------------------------------
+DECLARE
+    c_target_referral_id CONSTANT NUMBER := 115361;
+
+    -- Hard-coded values from screenshot
+    c_new_status_cd      CONSTANT VARCHAR2(6) := 'APR';
+    c_new_service_type   CONSTANT NUMBER      := 2;      -- SERVICE_TYPE = NUMBER
+    c_new_sub_type       CONSTANT VARCHAR2(6) := 'SD';   -- SERVICE_SUB_TYPE = VARCHAR2
+
+    -- for logging
+    v_referral_type PAS.PAS_REFERRAL.REFERRAL_TYPE%TYPE;
+BEGIN
+    -- Retrieve referral_type (optional but included for consistent logging)
+    SELECT r.referral_type
+      INTO v_referral_type
+      FROM PAS.PAS_REFERRAL r
+     WHERE r.referral_id = p_referral_id;
+
+    IF p_referral_id = c_target_referral_id THEN
+
+        UPDATE PAS.PAS_REFERRAL r
+           SET r.status_cd        = c_new_status_cd,
+               r.service_type     = c_new_service_type,
+               r.service_sub_type = c_new_sub_type
+         WHERE r.referral_id = p_referral_id;
+
+        v_upd_ref := SQL%ROWCOUNT;
+
+        log_event('RATCHET',
+            'Stage-0(HARDCODE): referral '||p_referral_id||
+            '; upd_rows='||v_upd_ref||
+            '; new_status='||c_new_status_cd||
+            '; service_type (NUM)='||c_new_service_type||
+            '; sub_type='||c_new_sub_type||
+            '; referral_type='||NVL(v_referral_type,'(null)')||
+            ' [TEMP: hard-coded override; TODO: parameterize]'
+        );
+
+    ELSE
+        v_upd_ref := 0;
+        log_event('RATCHET',
+            'Stage-0(NO-OP): referral '||p_referral_id||
+            ' != hard-coded target '||c_target_referral_id||
+            ' [TEMP: hard-coded override; TODO: parameterize]'
+        );
+    END IF;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        log_event('RATCHET',
+            'Stage-0 error(HARDCODE): '||SQLERRM
+        );
+END;
+
+
+
+  --------------------------------------------------------------------------
+  -- ===========================
+  -- Stage 1: Overviews + children (restore from *_HIST deletes)
+  -- ===========================
+  --------------------------------------------------------------------------
+
+  -- 1) Restore OVERVIEWS from history
+  INSERT INTO PAS.PAS_OVERVIEW
+  ( overview_id, referral_id, completion_date, overview_type_cd_id, onsite_review, comments12
+  , arranges_safety, direct_tasks, ident_needs, fax_to_nurse, fax_to_provider
+  , followup_requested, provider_followup, amend_id, created_by, created_time
+  , mod_by, mod_time, prior_overview_id, overview_status, ovrvw_tmp_type, renewal_date
+  , ovrvw_sts_rsn_cd, review_date, lev_of_care, hcp_name_id, cns_phone_nbr
+  , cnt_name_id, rsp_name_id, nrs_rvw_name, fax_id, under_rvw_ind, consumer_care_ind
+  , reactivate_date, comments, valid_flag )
+  SELECT
+    h.overview_id, h.referral_id, h.completion_date, h.overview_type_cd_id, h.onsite_review, h.comments12
+  , h.arranges_safety, h.direct_tasks, h.ident_needs, h.fax_to_nurse, h.fax_to_provider
+  , h.followup_requested, h.provider_followup, h.amend_id, h.created_by, h.created_time
+  , h.mod_by, h.mod_time, h.prior_overview_id, h.overview_status, h.ovrvw_tmp_type, h.renewal_date
+  , h.ovrvw_sts_rsn_cd, h.review_date, h.lev_of_care, h.hcp_name_id, h.cns_phone_nbr
+  , h.cnt_name_id, h.rsp_name_id, h.nrs_rvw_name, h.fax_id, h.under_rvw_ind, h.consumer_care_ind
+  , h.reactivate_date, h.comments, NVL(h.valid_flag,'Y')
+  FROM PAS.PAS_OVERVIEWS_HIST h
+  WHERE h.referral_id = p_referral_id
+    AND NVL(h.record_type,'delete') = 'delete'
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_OVERVIEW o WHERE o.overview_id = h.overview_id );
+  v_ins_ovr := SQL%ROWCOUNT;
+
+  -- 2) Reactivate soft-deleted OVERVIEWS
+  UPDATE PAS.PAS_OVERVIEW o
+     SET o.valid_flag = 'Y'
+   WHERE o.referral_id = p_referral_id
+     AND NVL(o.valid_flag,'Y') <> 'Y';
+  v_upd_ovr := SQL%ROWCOUNT;
+
+  -- 3) Restore INTAKE
+  INSERT INTO PAS.PAS_INTAKE
+  ( intake_id, overview_id, cns_name_id, adv_name, adv_prov_no, admit_date
+  , fin_name, fin_prov_no, rep_name, rep_phone, sign_by, sign_date
+  , created_by, created_time, mod_by, mod_time, completion_date
+  , referral_id, fax_id, delay_rsn_cd, oth_text, icd10 )
+  SELECT
+    h.intake_id, h.overview_id, h.cns_name_id, h.adv_name, h.adv_prov_no, h.admit_date
+  , h.fin_name, h.fin_prov_no, h.rep_name, h.rep_phone, h.sign_by, h.sign_date
+  , h.created_by, h.created_time, h.mod_by, h.mod_time, h.completion_date
+  , h.referral_id, h.fax_id, h.delay_rsn_cd, h.oth_text, h.icd10
+  FROM PAS.PAS_INTAKE_HIST h
+  WHERE h.referral_id = p_referral_id
+    AND EXISTS ( SELECT 1 FROM PAS.PAS_OVERVIEW o
+                 WHERE o.overview_id = h.overview_id
+                   AND o.referral_id = p_referral_id )
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_INTAKE i
+                     WHERE i.intake_id = h.intake_id );
+  v_ins_intake := SQL%ROWCOUNT;
+
+  -- 4) Restore DIAGNOSIS
+  INSERT INTO PAS.PAS_DIAGNOSIS
+  ( diagnosis_id, diag_from, diag_type, diag_desc, referral_id, overview_id, prescreen_id
+  , created_by, created_time, mod_by, mod_time )
+  SELECT
+    h.diagnosis_id, h.diag_from, h.diag_type, h.diag_desc, h.referral_id, h.overview_id, h.prescreen_id
+  , h.created_by, h.created_time, h.mod_by, h.mod_time
+  FROM PAS.PAS_DIAGNOSIS_HIST h
+  WHERE h.referral_id = p_referral_id
+    AND ( h.overview_id IS NULL
+          OR EXISTS ( SELECT 1 FROM PAS.PAS_OVERVIEW o
+                      WHERE o.overview_id = h.overview_id
+                        AND o.referral_id = p_referral_id ) )
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_DIAGNOSIS d
+                     WHERE d.diagnosis_id = h.diagnosis_id );
+  v_ins_diag := SQL%ROWCOUNT;
+
+  -- 5) Restore EVAL_XREF
+  INSERT INTO PAS.PAS_EVAL_XREF
+  ( evl_xref_id, evals_id, overview_id, created_by, created_time, mod_by, mod_time )
+  SELECT
+    h.evl_xref_id, h.evals_id, h.overview_id, h.created_by, h.created_time, h.mod_by, h.mod_time
+  FROM PAS.PAS_EVAL_XREF_HIST h
+  WHERE EXISTS ( SELECT 1 FROM PAS.PAS_OVERVIEW o
+                 WHERE o.overview_id = h.overview_id
+                   AND o.referral_id = p_referral_id )
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_EVAL_XREF x
+                     WHERE x.evl_xref_id = h.evl_xref_id );
+  v_ins_xref := SQL%ROWCOUNT;
+
+  -- 6) Reactivate OVERVIEW_EVAL and OVERVIEW_EVAL_DETAIL
+  UPDATE PAS.PAS_OVERVIEW_EVAL e
+     SET e.valid_flag = 'Y'
+   WHERE EXISTS ( SELECT 1 FROM PAS.PAS_OVERVIEW o
+                  WHERE o.overview_id = e.overview_id
+                    AND o.referral_id = p_referral_id )
+     AND NVL(e.valid_flag,'Y') <> 'Y';
+  v_upd_ovr_eval := SQL%ROWCOUNT;
+
+  UPDATE PAS.PAS_OVERVIEW_EVAL_DETAIL d
+     SET d.valid_flag = 'Y'
+   WHERE d.eval_id IN ( SELECT e.eval_id
+                        FROM PAS.PAS_OVERVIEW_EVAL e
+                        JOIN PAS.PAS_OVERVIEW o ON o.overview_id = e.overview_id
+                        WHERE o.referral_id = p_referral_id )
+     AND NVL(d.valid_flag,'Y') <> 'Y';
+  v_upd_ovr_evldtl := SQL%ROWCOUNT;
+
+  --------------------------------------------------------------------------
+  -- ===========================
+  -- Stage 2: Amendments ? Profiles (+ children) ? Discharges
+  -- ===========================
+  --------------------------------------------------------------------------
+
+  -- I) AMENDS
+  INSERT INTO PAS.PAS_AMENDS
+  ( amend_id, referral_id, service_type, amend_type, crnt_hrs, avg_util, temp_incr
+  , cns_name, cns_med_id, cnt_name, visit_date, request_rsn, date_faxed, agency, agy_phone, agy_emp_name
+  , amend_term, task_list, hrs_per_day, hrs_per_week, sun_hrs, mon_hrs, tues_hrs, weds_hrs, thurs_hrs, fri_hrs, sat_hrs
+  , amend_level, created_by, created_time, mod_by, mod_time, completion_date, amend_term_date, amend_sts_rsn_cd
+  , rsp_name, rsp_resp_type, rsp_other, rsp_mail_strt_addr, rsp_mail_city, rsp_mail_state_cd, rsp_mail_zipcode5
+  , rsp_work_phone, rsp_home_phone, new_rsp_reason, rsp_mail_zipcode4, nrs_rvw_name, amend_profile_id, amend_review_date
+  , fax_id, fax_id_response, consumer_care_ind, rsp_name_id, reactivate_date, agncy_support, agncy_initials
+  , tot_hrs_wk, transition_amend_ind, rqst_response )
+  SELECT
+    s.amend_id, s.referral_id, s.service_type, s.amend_type, s.crnt_hrs, s.avg_util, s.temp_incr
+  , s.cns_name, s.cns_med_id, s.cnt_name, s.visit_date, s.request_rsn, s.date_faxed, s.agency, s.agy_phone, s.agy_emp_name
+  , s.amend_term, s.task_list, s.hrs_per_day, s.hrs_per_week, s.sun_hrs, s.mon_hrs, s.tues_hrs, s.weds_hrs, s.thurs_hrs, s.fri_hrs, s.sat_hrs
+  , s.amend_level, s.created_by, s.created_time, s.mod_by, s.mod_time, s.completion_date, s.amend_term_date, s.amend_sts_rsn_cd
+  , s.rsp_name, s.rsp_resp_type, s.rsp_other, s.rsp_mail_strt_addr, s.rsp_mail_city, s.rsp_mail_state_cd, s.rsp_mail_zipcode5
+  , s.rsp_work_phone, s.rsp_home_phone, s.new_rsp_reason, s.rsp_mail_zipcode4, s.nrs_rvw_name, s.amend_profile_id, s.amend_review_date
+  , s.fax_id, s.fax_id_response, s.consumer_care_ind, s.rsp_name_id, s.reactivate_date, s.agncy_support, s.agncy_initials
+  , s.tot_hrs_wk, s.transition_amend_ind, s.rqst_response
+  FROM (
+    SELECT h.*,
+           ROW_NUMBER() OVER (PARTITION BY h.amend_id ORDER BY h.record_created_time DESC) rn
+    FROM PAS.PAS_AMENDS_HIST h
+    WHERE h.referral_id = p_referral_id
+      AND NVL(h.record_type,'delete') = 'delete'
+  ) s
+  WHERE s.rn = 1
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_AMENDS a WHERE a.amend_id = s.amend_id );
+  v_ins_amend := SQL%ROWCOUNT;
+
+  -- J) AMEND_SRVC
+  INSERT INTO PAS.PAS_AMEND_SRVC
+  ( amend_srvc_id, amend_id, srvc_code_val, created_by, created_time, mod_by, mod_time )
+  SELECT
+    s.amend_srvc_id, s.amend_id, s.srvc_code_val, s.created_by, s.created_time, s.mod_by, s.mod_time
+  FROM (
+    SELECT h.*,
+           ROW_NUMBER() OVER (PARTITION BY h.amend_srvc_id ORDER BY h.record_created_time DESC) rn
+    FROM PAS.PAS_AMEND_SRVC_HIST h
+    WHERE EXISTS ( SELECT 1 FROM PAS.PAS_AMENDS a WHERE a.amend_id = h.amend_id )
+  ) s
+  WHERE s.rn = 1
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_AMEND_SRVC x WHERE x.amend_srvc_id = s.amend_srvc_id );
+  v_ins_amend_srvc := SQL%ROWCOUNT;
+
+  -- A) PROFILES
+  INSERT INTO PAS.PAS_PROFILE
+  ( profile_id, overview_id, profile_type_cd_id, prior_profile_id, completion_date
+  , onsite_indicator, onsite_date, other_service_cd_id, other_service_descr
+  , nurse_date, agency_choice2, amendment_type, change_status, companion_case, companion_rel
+  , denial_date, effective_date, notes, recmd_rfl_for, satellite_id, term_date
+  , waiver_id, change_id, agency_choice1, auth_letter_date, prescreen_id, amend_id
+  , created_by, created_time, mod_by, mod_time, nrs_rvw_name, fax_id
+  , under_rvw_ind, shrt_trm_ind, freedom_choice_ind, ag_vs_sd_choice_ind
+  , cfc_vs_pas_choice_ind, home_vs_inst_choice_ind )
+  SELECT
+    s.profile_id, s.overview_id, s.profile_type_cd_id, s.prior_profile_id, s.completion_date
+  , s.onsite_indicator, s.onsite_date, s.other_service_cd_id, s.other_service_descr
+  , s.nurse_date, s.agency_choice2, s.amendment_type, s.change_status, s.companion_case, s.companion_rel
+  , s.denial_date, s.effective_date, s.notes, s.recmd_rfl_for, s.satellite_id, s.term_date
+  , s.waiver_id, s.change_id, s.agency_choice1, s.auth_letter_date, s.prescreen_id, s.amend_id
+  , s.created_by, s.created_time, s.mod_by, s.mod_time, s.nrs_rvw_name, s.fax_id
+  , s.under_rvw_ind, s.shrt_trm_ind, s.freedom_choice_ind, s.ag_vs_sd_choice_ind
+  , s.cfc_vs_pas_choice_ind, s.home_vs_inst_choice_ind
+  FROM (
+    SELECT h.*,
+           ROW_NUMBER() OVER (PARTITION BY h.profile_id ORDER BY h.record_created_time DESC) rn
+    FROM PAS.PAS_PROFILE_HIST h
+    WHERE EXISTS ( SELECT 1 FROM PAS.PAS_OVERVIEW o
+                   WHERE o.overview_id = h.overview_id
+                     AND o.referral_id = p_referral_id )
+      AND NVL(h.record_type,'delete') = 'delete'
+  ) s
+  WHERE s.rn = 1
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_PROFILE p WHERE p.profile_id = s.profile_id );
+  v_ins_prof := SQL%ROWCOUNT;
+
+  -- B) PROFILE_DATES
+  INSERT INTO PAS.PAS_PROFILE_DATES
+  ( prof_dt_id, profile_id, overview_id, seq, start_date, end_date, mod_by, mod_time, dschrg_ind )
+  SELECT
+    s.prof_dt_id, s.profile_id, s.overview_id, s.seq, s.start_date, s.end_date, s.mod_by, s.mod_time, s.dschrg_ind
+  FROM (
+    SELECT h.*,
+           ROW_NUMBER() OVER (PARTITION BY h.prof_dt_id ORDER BY h.record_created_time DESC) rn
+    FROM PAS.PAS_PROFILE_DATES_HIST h
+    WHERE EXISTS ( SELECT 1 FROM PAS.PAS_PROFILE p WHERE p.profile_id = h.profile_id )
+  ) s
+  WHERE s.rn = 1
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_PROFILE_DATES d WHERE d.prof_dt_id = s.prof_dt_id );
+  v_ins_prof_dt := SQL%ROWCOUNT;
+
+  -- C) PROFILE_HRS1
+  INSERT INTO PAS.PAS_PROFILE_HRS1
+  ( prof_hr_id, profile_id, adl_hrs, hma_hrs, ht_hrs, med_ind, mod_by, mod_time, cfc_hrs, pers_ind )
+  SELECT
+    s.prof_hr_id, s.profile_id, s.adl_hrs, s.hma_hrs, s.ht_hrs, s.med_ind, s.mod_by, s.mod_time, s.cfc_hrs, s.pers_ind
+  FROM (
+    SELECT h.*,
+           ROW_NUMBER() OVER (PARTITION BY h.prof_hr_id ORDER BY h.record_created_time DESC) rn
+    FROM PAS.PAS_PROFILE_HRS_HIST h
+    WHERE EXISTS ( SELECT 1 FROM PAS.PAS_PROFILE p WHERE p.profile_id = h.profile_id )
+  ) s
+  WHERE s.rn = 1
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_PROFILE_HRS1 ph WHERE ph.prof_hr_id = s.prof_hr_id );
+  v_ins_prof_hrs := SQL%ROWCOUNT;
+
+  -- D) PROVIDERS
+  INSERT INTO PAS.PAS_PROVIDERS
+  ( provider_id, profile_id, name_id, start_date, end_date, created_by, created_time, mod_by, mod_time, primary_ind )
+  SELECT
+    s.provider_id, s.profile_id, s.name_id, s.start_date, s.end_date, s.created_by, s.created_time, s.mod_by, s.mod_time, s.primary_ind
+  FROM (
+    SELECT h.*,
+           ROW_NUMBER() OVER (PARTITION BY h.provider_id ORDER BY h.record_created_time DESC) rn
+    FROM PAS.PAS_PROVIDERS_HIST h
+    WHERE EXISTS ( SELECT 1 FROM PAS.PAS_PROFILE p WHERE p.profile_id = h.profile_id )
+  ) s
+  WHERE s.rn = 1
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_PROVIDERS v WHERE v.provider_id = s.provider_id );
+  v_ins_prov := SQL%ROWCOUNT;
+
+  -- E) PROFILE_SERVICES (dedup per (PROFILE_ID, SERVICE_CD_ID); guard PK + UNQ)
+  INSERT INTO PAS.PAS_PROFILE_SERVICES
+  ( services_id, profile_id, service_cd_id, service_impair_level_cd_id,
+    minutes, days_per_week, comments, created_by, created_time, mod_by, mod_time, service_met_cd )
+  SELECT
+    s.services_id, s.profile_id, s.service_cd_id, s.service_impair_level_cd_id,
+    s.minutes, s.days_per_week, s.comments, s.created_by, s.created_time, s.mod_by, s.mod_time, s.service_met_cd
+  FROM (
+    SELECT h.*,
+           ROW_NUMBER() OVER (
+             PARTITION BY h.profile_id, h.service_cd_id
+             ORDER BY h.record_created_time DESC
+           ) rn
+    FROM PAS.PAS_PROFILE_SERVICES_HIST h
+    WHERE EXISTS (SELECT 1 FROM PAS.PAS_PROFILE p WHERE p.profile_id = h.profile_id)
+  ) s
+  WHERE s.rn = 1
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_PROFILE_SERVICES ps
+                     WHERE ps.services_id = s.services_id )
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_PROFILE_SERVICES ps
+                     WHERE ps.profile_id = s.profile_id
+                       AND ps.service_cd_id = s.service_cd_id );
+  v_ins_prof_srv := SQL%ROWCOUNT;
+
+  -- F) PROFILE_SERVICES_DETAILS
+  INSERT INTO PAS.PAS_PROFILE_SERVICES_DETAILS
+  ( services_dtl_id, services_id, service_detail_cd_id, created_by, created_time, mod_by, mod_time )
+  SELECT
+    s.services_dtl_id, s.services_id, s.service_detail_cd_id, s.created_by, s.created_time, s.mod_by, s.mod_time
+  FROM (
+    SELECT h.*,
+           ROW_NUMBER() OVER (PARTITION BY h.services_dtl_id ORDER BY h.record_created_time DESC) rn
+    FROM PAS.PAS_PROFILE_SERVICES_DTLS_HIST h
+    WHERE EXISTS ( SELECT 1 FROM PAS.PAS_PROFILE_SERVICES s WHERE s.services_id = h.services_id )
+  ) s
+  WHERE s.rn = 1
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_PROFILE_SERVICES_DETAILS d WHERE d.services_dtl_id = s.services_dtl_id );
+  v_ins_prof_srvdtl := SQL%ROWCOUNT;
+
+  -- G) PROFILE_MATRIX
+  INSERT INTO PAS.PAS_PROFILE_MATRIX
+  ( mtrix_id, pk_parent, pk_child, level1_cat, level1_order, level2_cat, level2_order
+  , level3_cat, level3_order, level4_cat, level4_order, selected, cd_pk, cmnt, hdr_col, multi )
+  SELECT
+    s.mtrix_id, s.pk_parent, s.pk_child, s.level1_cat, s.level1_order, s.level2_cat, s.level2_order
+  , s.level3_cat, s.level3_order, s.level4_cat, s.level4_order, s.selected, s.cd_pk, s.cmnt, s.hdr_col, s.multi
+  FROM (
+    SELECT h.*,
+           ROW_NUMBER() OVER (PARTITION BY h.mtrix_id ORDER BY h.record_created_time DESC) rn
+    FROM PAS.PAS_PROFILE_MATRIX_HIST h
+    WHERE EXISTS ( SELECT 1 FROM PAS.PAS_PROFILE p WHERE p.profile_id = h.pk_parent )
+  ) s
+  WHERE s.rn = 1
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_PROFILE_MATRIX m WHERE m.mtrix_id = s.mtrix_id );
+  v_ins_prof_mtrx := SQL%ROWCOUNT;
+
+  -- H) DISCHARGES
+  INSERT INTO PAS.PAS_DISCHARGES
+  ( discharge_id, profile_id, provider_id, cns_name_id, dschrg_type, oth_text
+  , rqst_agency, rqst_city, discharge_text, discharge_date, sign_by, sign_date
+  , agency, created_by, created_time, mod_by, mod_time, completion_date
+  , admit_date, referral_id, dschrg_stp, reactivate_date, fax_id, final_date
+  , mp_discharge_date, enrolled_else_ind, out_of_state_ind )
+  SELECT
+    s.discharge_id, s.profile_id, s.provider_id, s.cns_name_id, s.dschrg_type, s.oth_text
+  , s.rqst_agency, s.rqst_city, s.discharge_text, s.discharge_date, s.sign_by, s.sign_date
+  , s.agency, s.created_by, s.created_time, s.mod_by, s.mod_time, s.completion_date
+  , s.admit_date, s.referral_id, s.dschrg_stp, s.reactivate_date, s.fax_id, s.final_date
+  , s.mp_discharge_date, s.enrolled_else_ind, s.out_of_state_ind
+  FROM (
+    SELECT h.*,
+           ROW_NUMBER() OVER (PARTITION BY h.discharge_id ORDER BY h.record_created_time DESC) rn
+    FROM PAS.PAS_DISCHARGES_HIST h
+    WHERE h.referral_id = p_referral_id
+  ) s
+  WHERE s.rn = 1
+    AND ( s.profile_id IS NULL OR EXISTS ( SELECT 1 FROM PAS.PAS_PROFILE p WHERE p.profile_id = s.profile_id ) )
+    AND NOT EXISTS ( SELECT 1 FROM PAS.PAS_DISCHARGES d WHERE d.discharge_id = s.discharge_id );
+  v_ins_dsch := SQL%ROWCOUNT;
+
+  --------------------------------------------------------------------------
+  -- ===========================
+  -- Stage 3: Capacities (from *_HIST back to live)
+  -- ===========================
+  --------------------------------------------------------------------------
+  DECLARE
+    l_cols     VARCHAR2(32767);
+    l_sel_cols VARCHAR2(32767);
+    l_sql      CLOB;
+  BEGIN
+    -- Build column list for PAS_CAPACITIES and matching select list from PAS_CAPACITIES_HIST
+    FOR c IN (
+      SELECT column_name
+      FROM   ALL_TAB_COLUMNS
+      WHERE  OWNER      = 'PAS'
+      AND    TABLE_NAME = 'PAS_CAPACITIES'
+      ORDER  BY column_id
+    ) LOOP
+      IF l_cols IS NULL THEN
+        l_cols     := c.column_name;
+        l_sel_cols := 'h.'||c.column_name;
+      ELSE
+        l_cols     := l_cols||','||c.column_name;
+        l_sel_cols := l_sel_cols||','||'h.'||c.column_name;
+      END IF;
+    END LOOP;
+
+    l_sql := 'INSERT INTO PAS.PAS_CAPACITIES ('||l_cols||') '||
+             'SELECT '||l_sel_cols||' '||
+             'FROM PAS.PAS_CAPACITIES_HIST h '||
+             'WHERE h.referral_id = :1 '||
+             '  AND NVL(h.record_type,''delete'') = ''delete'' '||
+             '  AND NOT EXISTS (SELECT 1 FROM PAS.PAS_CAPACITIES c WHERE c.capacity_id = h.capacity_id)';
+
+    EXECUTE IMMEDIATE l_sql USING p_referral_id;
+    v_ins_caps := SQL%ROWCOUNT;
+  EXCEPTION
+    WHEN OTHERS THEN
+      -- If dictionary access is restricted, log and skip capacities rather than fail entire run
+      log_event('RATCHET', 'Stage-3 capacities restore skipped due to: '||SQLERRM);
+  END;
+
+  --------------------------------------------------------------------------
+  -- Summary + commit/rollback control
+  --------------------------------------------------------------------------
+  log_event('RATCHET',
+    'S0: REF upd='||v_upd_ref||
+    ' | S1: OVR ins='||v_ins_ovr||' setY='||v_upd_ovr||
+    '; INT ins='||v_ins_intake||'; DIAG ins='||v_ins_diag||
+    '; XREF ins='||v_ins_xref||'; OVR_EVAL setY='||v_upd_ovr_eval||
+    '; OVR_EVAL_DTL setY='||v_upd_ovr_evldtl||
+    ' | S2: AMEND ins='||v_ins_amend||'; AMEND_SRVC ins='||v_ins_amend_srvc||
+    '; PROF ins='||v_ins_prof||'; PROF_DT ins='||v_ins_prof_dt|| 
+    '; PROF_HRS ins='||v_ins_prof_hrs||'; PROV ins='||v_ins_prov||
+    '; PRF_SRV ins='||v_ins_prof_srv||'; PRF_SRV_DTL ins='||v_ins_prof_srvdtl||
+    '; PRF_MTRX ins='||v_ins_prof_mtrx||'; DSCH ins='||v_ins_dsch||
+    ' | S3: CAPS ins='||v_ins_caps
+  );
+
+  DBMS_OUTPUT.PUT_LINE('RATCHET SUMMARY for referral '||p_referral_id||':');
+  DBMS_OUTPUT.PUT_LINE('  [S0] Referral updated: '||v_upd_ref);
+  DBMS_OUTPUT.PUT_LINE('  [S1] Overviews inserted: '||v_ins_ovr||', reactivated: '||v_upd_ovr);
+  DBMS_OUTPUT.PUT_LINE('  [S1] Intake inserted: '||v_ins_intake);
+  DBMS_OUTPUT.PUT_LINE('  [S1] Diagnosis inserted: '||v_ins_diag);
+  DBMS_OUTPUT.PUT_LINE('  [S1] Eval XRef inserted: '||v_ins_xref);
+  DBMS_OUTPUT.PUT_LINE('  [S1] Overview_Eval reactivated: '||v_upd_ovr_eval);
+  DBMS_OUTPUT.PUT_LINE('  [S1] Overview_Eval_Detail reactivated: '||v_upd_ovr_evldtl);
+  DBMS_OUTPUT.PUT_LINE('  [S2] Amendments inserted: '||v_ins_amend);
+  DBMS_OUTPUT.PUT_LINE('  [S2] Amendment Services inserted: '||v_ins_amend_srvc);
+  DBMS_OUTPUT.PUT_LINE('  [S2] Profiles inserted: '||v_ins_prof);
+  DBMS_OUTPUT.PUT_LINE('  [S2] Profile_Dates inserted: '||v_ins_prof_dt);
+  DBMS_OUTPUT.PUT_LINE('  [S2] Profile_Hrs inserted: '||v_ins_prof_hrs);
+  DBMS_OUTPUT.PUT_LINE('  [S2] Providers inserted: '||v_ins_prov);
+  DBMS_OUTPUT.PUT_LINE('  [S2] Profile_Services inserted: '||v_ins_prof_srv);
+  DBMS_OUTPUT.PUT_LINE('  [S2] Profile_Service_Details inserted: '||v_ins_prof_srvdtl);
+  DBMS_OUTPUT.PUT_LINE('  [S2] Profile_Matrix inserted: '||v_ins_prof_mtrx);
+  DBMS_OUTPUT.PUT_LINE('  [S2] Discharges inserted: '||v_ins_dsch);
+  DBMS_OUTPUT.PUT_LINE('  [S3] Capacities inserted: '||v_ins_caps);
+
+  IF UPPER(p_commit) = 'Y' THEN
+    COMMIT;
+    log_event('RATCHET', 'COMMIT completed for referral '||p_referral_id);
+  ELSE
+    ROLLBACK;
+    log_event('RATCHET', 'DRY-RUN rollback for referral '||p_referral_id);
+  END IF;
+
+EXCEPTION
+  WHEN OTHERS THEN
+    log_event('RATCHET', 'ERROR for referral '||p_referral_id||' -> '||SQLERRM);
+    ROLLBACK;
+    RAISE;
+END ratchet;
+
